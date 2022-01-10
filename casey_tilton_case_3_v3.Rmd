@@ -1,0 +1,702 @@
+---
+title: "Casey Tilton Case 3"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Prompt
+
+You are part of a research and modeling team at National City Bank.  You team has been asked to create a customer propensity model for a new product, specifically a line of credit against a household’s used car. Since the line of credit product is only in pilot, you are asked to identify the next 100 customers from a prospective customer list to contact.  Bankers will call and direct mail will be sent to households your model identifies with the greatest probability of accepting the offer.  Once your team has modeled and identified the customers, you must present your findings to the bank’s chief product officer.  Once she/he feels comfortable with your proposal, marketing will begin its process.  
+
+You are asked to examine the historical data from 4000 previous calls and mailings for the line of credit offer.  Using this historical data, and any supplemental data, create a propensity model, evaluate it and identify by uniqueID the top 100 households to contact from the prospective customer list.  Additionally, bank executives are eager to learn more about the customer profile for historical and top prospective customers.  As a result, variable importance and sound EDA will aid the presentation.  Your team will need to turn in code and PowerPoint slides.
+
+
+
+# setup
+
+```{r}
+# Libs
+library(tidyverse)
+library(vtreat)
+library(caret)
+library(lubridate)
+library(scales)
+library(pROC)
+library(rpart.plot) 
+library(randomForest)
+library(MLmetrics)
+library(e1071)
+library(class)
+theme_set(theme_bw())
+```
+
+
+```{r}
+options(scipen=999)
+```
+
+### read in data
+
+```{r}
+# Raw data
+currentcustomers_raw   <- read_csv('CurrentCustomerMktgResults.csv')
+vehicle <- read_csv('householdVehicleData.csv')
+household_axiom <- read_csv("householdAxiomData.csv")
+household_credit <- read_csv("householdCreditData.csv")
+                  
+```
+
+### join customers dataset with supplemental data
+
+```{r}
+
+customers_joined <- currentcustomers_raw %>%
+  left_join(vehicle, by = c('HHuniqueID'))%>%
+  left_join(household_axiom, by = 'HHuniqueID')%>%
+  left_join(household_credit, by = 'HHuniqueID')
+
+```
+
+
+
+# EDA
+
+### find columns with high percentages of NA
+
+```{r}
+
+sum_na_df <- data.frame(map(customers_joined, ~sum(is.na(.))))%>%
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "sum_na") %>% 
+  mutate(variable = fct_reorder(variable, sum_na))
+
+ggplot(sum_na_df, aes(variable, sum_na))+
+  geom_col(fill = "red")+
+  coord_flip()+
+  labs(y = "# of customers missing variable")
+
+
+```
+
+## exploring variables with high percentages of NA
+
+### past_Outcome
+
+For some variables, we can’t assume why data is missing. But in this case, ‘past_Outcome == NA’ is the same as ‘Prev_Attempts == 0’. So if we agree that ‘Prev_Attempts == 0’ is an important data point as it relates to the Y variable, then past_Outcome isn’t actually missing 75% of its data. Past_Outcome == “no_attempt” isn’t the same as missing data. It’s just another category in the past_outcome variable, and vtreat should be able to deal with it. 
+
+```{r}
+
+customers_joined %>%
+  count(past_Outcome, sort = TRUE) %>%
+  ggplot(aes(past_Outcome, n))+
+  geom_col()
+
+ggplot(customers_joined, aes(PrevAttempts, past_Outcome, fill = Y_AcceptedOffer))+
+  geom_col()
+
+```
+
+
+### Est_Race
+
+```{r}
+
+customers_joined %>%
+  count(EstRace, sort = TRUE) %>% 
+  ggplot(aes(EstRace, n))+
+  geom_col(fill = "red")+
+  coord_flip()
+```
+
+
+### feature engineering
+
+changes:
+
+1. add a call length variable (not ultimately used in the model)
+2. change NAs in past_Outcome to "no_previous_attempt"
+3. clean annual Donations variable
+```{r}
+customers_complete <- customers_joined %>%
+  mutate(call_length = period_to_seconds(hms(CallEnd)) - period_to_seconds(hms(CallStart)))%>%
+  mutate(past_Outcome = replace_na(past_Outcome, "no_prev_attempt"))%>%
+  mutate(annualDonations = as.numeric(gsub('\\$|,', '',annualDonations)))
+
+```
+
+### showing change to past_Outcome
+
+```{r}
+customers_complete %>%
+  count(past_Outcome, Y_AcceptedOffer, sort = TRUE) %>%
+  ggplot(aes(past_Outcome, n, fill = Y_AcceptedOffer))+
+  geom_col()
+
+ggplot(customers_complete, aes(PrevAttempts, past_Outcome, fill = Y_AcceptedOffer))+
+  geom_col()
+```
+
+### more EDA
+
+```{r}
+customers_complete %>%
+  count(past_Outcome, sort = TRUE)
+
+ggplot(customers_complete, aes(call_length, fill = Y_AcceptedOffer))+
+  geom_histogram(show.legend = FALSE)+
+  scale_x_log10()+
+  facet_wrap(~Y_AcceptedOffer)
+
+ggplot(customers_complete, aes(call_length/60, Y_AcceptedOffer))+
+  geom_boxplot()+
+  labs(x = "call length (minutes)",
+       y = "")
+
+ggplot(customers_complete, aes(Age, fill = Y_AcceptedOffer))+
+  geom_histogram(binwidth = 5,show.legend = FALSE)+
+  facet_wrap(~Y_AcceptedOffer)
+
+ggplot(customers_complete, aes(Age, Y_AcceptedOffer))+
+  geom_boxplot()
+
+ggplot(customers_complete, aes(RecentBalance, fill = Y_AcceptedOffer))+
+  geom_histogram(show.legend = FALSE)+
+  scale_x_log10(labels = dollar)+
+  facet_wrap(~Y_AcceptedOffer, scales = "free_x")
+
+ggplot(customers_complete, aes(RecentBalance, Y_AcceptedOffer))+
+  geom_boxplot()+
+  scale_x_log10(labels = dollar)
+
+ggplot(customers_complete, aes(RecentBalance, fill = Y_AcceptedOffer))+
+  geom_histogram()+
+  scale_x_log10(labels = dollar)
+
+
+ggplot(customers_complete, aes(PrevAttempts, fill = Y_AcceptedOffer))+
+  geom_histogram(position = "identity", alpha = .4, color = "black")+
+  scale_x_log10()+
+  facet_wrap(~Y_AcceptedOffer)
+
+ggplot(customers_complete, aes(PrevAttempts, fill = Y_AcceptedOffer))+
+  geom_histogram()+
+  scale_x_log10()
+
+customers_complete %>%
+  count(PrevAttempts, sort = TRUE)
+```
+
+```{r}
+
+customers_complete %>%
+  ggplot(aes(annualDonations, fill = Y_AcceptedOffer))+
+  geom_histogram()+
+  facet_wrap(~ Y_AcceptedOffer)+
+  scale_x_log10()
+
+customers_complete %>%
+  count(Education, Y_AcceptedOffer, sort = TRUE)%>%
+  ggplot(aes(Education, n, fill = Y_AcceptedOffer))+
+  geom_col(position = "fill")+
+  scale_y_continuous(labels = percent)+
+  labs(y = "")
+
+customers_complete %>%
+  count(Marital, Y_AcceptedOffer, sort = TRUE)%>%
+  ggplot(aes(Marital, n, fill = Y_AcceptedOffer))+
+  geom_col(position = "fill")
+
+customers_complete %>%
+  count(carMake = fct_lump(carMake, 25), Y_AcceptedOffer, sort = TRUE)%>%
+  mutate(carMake = fct_reorder(carMake, n))%>%
+  ggplot(aes(carMake, n, fill = Y_AcceptedOffer))+
+  geom_col()+
+  coord_flip()+
+  labs(y = "# of customers who own make of car",
+       x = "Car make")
+
+customers_complete %>%
+  count(carMake = fct_lump(carMake, 25), Y_AcceptedOffer, sort = TRUE)%>%
+  mutate(carMake = fct_reorder(carMake, n))%>%
+  ggplot(aes(carMake, n, fill = Y_AcceptedOffer))+
+  geom_col(position = "fill")+
+  coord_flip()+
+  scale_y_continuous(labels = percent)+
+  labs(y = "% of customers with each car make who accepted or did not accept offer",
+       x = "Car make")
+  
+
+customers_complete %>%
+  count(past_Outcome, Y_AcceptedOffer)%>%
+  ggplot(aes(past_Outcome,n, fill= Y_AcceptedOffer))+
+  geom_col()
+
+customers_complete %>%
+  filter(past_Outcome == "success", Y_AcceptedOffer == "DidNotAccept")
+
+```
+
+
+
+# Modeling
+
+## SAMPLE: Partition schema
+```{r}
+
+customers_complete_model <- customers_complete %>%
+  mutate(Y_AcceptedOffer = ifelse(Y_AcceptedOffer == "Accepted", 1,0))%>%
+  mutate(Y_AcceptedOffer = as.factor(Y_AcceptedOffer))
+
+set.seed(1234)
+idx       <- createDataPartition(customers_complete_model$Y_AcceptedOffer, p=.8, list = F)
+train_data <- customers_complete_model[idx,]
+test_data  <- customers_complete_model[-idx,]
+```
+
+
+
+## MODIFY: Vtreat, need to declare xVars & name of Y var
+
+```{r}
+
+xVars <- c("Communication", "LastContactDay", "LastContactMonth", "NoOfContacts", "DaysPassed", "PrevAttempts", "past_Outcome", "carMake", "carModel", "carYr",      "headOfhouseholdGender","PetsPurchases", "DigitalHabits_5_AlwaysOn", "AffluencePurchases", "Age", "Job","Marital", "Education", "DefaultOnRecord", "RecentBalance", "HHInsurance", "CarLoan")
+
+
+yVar  <- c("Y_AcceptedOffer")
+
+successClass <- "1"
+
+plan  <- designTreatmentsC(customers_complete_model, varlist = xVars, outcomename = yVar, outcometarget = successClass)
+
+```
+
+## Apply the rules to the set
+
+```{r}
+treated_train <- prepare(plan, train_data)
+treated_test  <- prepare(plan, test_data)
+```
+
+
+## logistic regression with glm function
+
+```{r}
+fit2 <- glm(Y_AcceptedOffer ~., data = treated_train, family ='binomial')
+
+summary(fit2)
+
+```
+
+### Finding best fit with stepwise backward elimination
+
+Commented out for knitting
+
+```{r}
+#best_fit <- step(fit2, direction='backward')
+```
+
+
+```{r}
+#saveRDS(best_fit, 'bestFit_glm.rds')
+best_fit <- read_rds('bestFit_glm.rds')
+```
+
+### ASSESS: Predict & calculate the KPI appropriate for classification
+
+```{r}
+summary(best_fit)
+
+length(coefficients(fit2))
+length(coefficients(best_fit))
+
+training_preds <- predict(best_fit, treated_train, type= "response")
+testing_preds  <- predict(best_fit, treated_test, type= "response")
+
+# Classify 
+cutoff      <- 0.5
+customer_classes <- ifelse(training_preds >= cutoff, 1,0)
+
+# Organize w/Actual
+results <- data.frame(actual  = as.factor(train_data$Y_AcceptedOffer),
+                      customer = train_data$HHuniqueID,
+                      classes = as.factor(customer_classes),
+                      probs   = training_preds)
+
+
+train_confMat <- confusionMatrix(results$classes, results$actual, positive = "1")
+
+train_confMat
+
+ggplot(results, aes(x=probs, color=as.factor(actual))) +
+  geom_density() + 
+  geom_vline(aes(xintercept = cutoff), color = 'green')
+
+# ROC
+ROCobj <- roc(as.numeric(results$classes), as.numeric(results$actual))
+plot(ROCobj)
+
+# AUC
+auc(as.numeric(results$classes), as.numeric(results$actual))
+```
+
+### compare model to test set
+
+
+```{r}
+# Classify 
+cutoff      <- 0.5
+customer_classes <- ifelse(testing_preds >= cutoff, 1,0)
+
+# Organize w/Actual
+results <- data.frame(actual  = as.factor(test_data$Y_AcceptedOffer),
+                      customer = test_data$HHuniqueID,
+                      classes = as.factor(customer_classes),
+                      probs   = testing_preds)
+
+
+test_confMat <- confusionMatrix(results$classes, results$actual, positive = "1")
+
+test_confMat
+```
+
+
+## Random forest classification with randomForest() function
+
+```{r}
+set.seed(1234)
+
+rf_tuned_model <- randomForest(as.factor(Y_AcceptedOffer) ~ .,
+                           data  = treated_train, 
+                           ntree = 500,
+                           mtry = 12)
+
+rf_tuned_model
+
+# Confusion Matrix, compare to 3 trees ~63% accuracy
+trainClass <- predict(rf_tuned_model, treated_train)
+caret::confusionMatrix(trainClass, as.factor(treated_train$Y_AcceptedOffer), positive = "1")
+
+# Look at var importance
+varImpPlot(rf_tuned_model)
+```
+
+### find optimal tuning parameters
+
+### Out of Bag OOB
+
+avg prediction error on each training sample using trees that weren't built with those records (similar to a validation)
+
+```{r}
+# plot the RF with a legend
+# https://stackoverflow.com/questions/20328452/legend-for-random-forest-plot-in-r
+layout(matrix(c(1,2),nrow=1),
+       width=c(4,1)) 
+par(mar=c(5,4,4,0)) #No margin on the right side
+plot(rf_tuned_model, log="y")
+par(mar=c(5,0,4,2)) #No margin on the left side
+plot(c(0,1),type="n", axes=F, xlab="", ylab="")
+legend("top", colnames(rf_tuned_model$err.rate),col=1:4,cex=0.8,fill=1:4)
+```
+
+
+### for loop to find optimal mtry number (number of variables tried at each split)
+
+```{r}
+
+oob_values <- vector(length = 40)
+not_accepted_values <- vector(length = 40) 
+accepted_values <- vector(length = 40)
+trainset_accuracy <- vector(length = 40)
+testset_accuracy <- vector(length = 40)
+testset_sensitivity <- vector(length = 40)
+
+for(i in 1:40) {
+  temp_model <- temp_model <- randomForest(as.factor(Y_AcceptedOffer) ~ .,
+                           data  = treated_train, 
+                           ntree = 150,
+                           mtry = i)
+  train_temp_preds <- predict(temp_model, treated_train)
+  test_temp_preds <- predict(temp_model, treated_test)
+  train_tempconfmat <- caret::confusionMatrix(train_temp_preds,
+                                        as.factor(treated_train$Y_AcceptedOffer),
+                                        positive = "1")
+  test_tempconfmat <- caret::confusionMatrix(test_temp_preds,
+                                        as.factor(treated_test$Y_AcceptedOffer),
+                                        positive = "1")
+  testset_sensitivity[i] <- test_tempconfmat$byClass[[1]]
+  testset_accuracy[i] <- Accuracy(treated_test$Y_AcceptedOffer, test_temp_preds)
+  trainset_accuracy[i] <- Accuracy(treated_train$Y_AcceptedOffer, train_temp_preds)
+  oob_values[i] <- temp_model$err.rate[nrow(temp_model$err.rate), 1]
+  not_accepted_values[i] <- temp_model$err.rate[nrow(temp_model$err.rate), 2]
+  accepted_values[i] <- temp_model$err.rate[nrow(temp_model$err.rate), 3]
+  print(i)
+}
+
+ntry_changes <- data.frame(OOB = oob_values, not_accepted_OOB = not_accepted_values, accepted_OOB = accepted_values, testset_error = 1-testset_accuracy, testset_false_neg = 1- testset_sensitivity, trainset_error = 1 - trainset_accuracy) %>%
+  mutate(mtry = row_number())%>%
+  pivot_longer(cols = !mtry, names_to = "error_type", values_to = "error_rate")
+
+ggplot(ntry_changes, aes(mtry, error_rate, color = error_type))+
+  geom_line()+
+  labs(title = "What is the optimal mtry number?",
+       subtitle = "mtry = number of variables tried at each split",
+       y = "Error rate",
+       x = "Mtry",
+       color = "Error type")
+  
+```
+
+
+### apply random forest model to the validation test set
+
+```{r}
+test_model<- predict(rf_tuned_model, treated_test)
+
+
+# Accuracy Comparison from MLmetrics
+Accuracy(treated_test$Y_AcceptedOffer, test_model)
+confmat <- caret::confusionMatrix(test_model, as.factor(treated_test$Y_AcceptedOffer), positive = "1")
+
+confmat
+
+
+```
+
+
+### RF tune grid
+
+This took 1.5 hours to run so I commented it out
+Resulted in 12 being the optimal mtry number, which is also apparent in the for loop above
+
+```{r}
+# set.seed(1234)
+# control <- trainControl(method="repeatedcv", number=10, repeats=3, search="grid")
+# 
+# tunegrid <- expand.grid(.mtry=c(1:15))
+# # rf_gridsearch <- train(as.factor(Y_AcceptedOffer) ~ .,
+# #                        data=treated_train,
+# #                        method="rf",
+# #                        metric="Accuracy",
+# #                        tuneGrid=tunegrid,
+# #                        trControl=control)
+# print(rf_gridsearch)
+# plot(rf_gridsearch)
+```
+
+
+
+## K-nearest neighbors 
+
+I commented out the model so that I could knit later
+```{r}
+
+# knnFit <- train(Y_AcceptedOffer ~ .,
+#                 data = treated_train,
+#                 method = "knn",
+#                 preProcess = c("center","scale"),
+#                 tuneLength = 15)
+
+
+```
+
+```{r}
+#saveRDS(knnFit, 'knnFit.rds')
+knnFit <-  read_rds('knnFit.rds')
+```
+
+```{r}
+knnFit
+plot(knnFit)
+```
+
+
+```{r}
+# training set accuracy
+
+trainClasses <- predict(knnFit,treated_train)
+resultsDF    <- data.frame(actual = treated_train$Y_AcceptedOffer, 
+                        classes = trainClasses)
+head(resultsDF)
+
+caret::confusionMatrix(trainClasses, treated_train$Y_AcceptedOffer, positive = "1")
+
+Accuracy(trainClasses, treated_train$Y_AcceptedOffer)
+
+# Testing set accuracy; PREDICT WILL CENTER THE NEW DATA FOR YOU!!
+testClasses <- predict(knnFit,treated_test)
+table(testClasses,treated_test$Y_AcceptedOffer)
+Accuracy(testClasses,treated_test$Y_AcceptedOffer)
+
+caret::confusionMatrix(testClasses, treated_test$Y_AcceptedOffer, positive = "1")
+
+# To see probabilities 
+trainProbs <- predict(knnFit, treated_train, type=c('prob'))
+head(trainProbs)
+```
+
+
+
+```{r}
+testing_preds  <- predict(best_fit, treated_test, type= "response")
+
+
+rf_test_model<- predict(rf_tuned_model, treated_test, type= "prob")%>%
+  view()
+
+
+```
+
+
+
+# Using model predictions to identify top 100 prospective customers
+
+
+## Load Raw Data
+
+```{r}
+prospects <- read_csv("ProspectiveCustomers_case3.csv")
+```
+
+## 2. Join with external data
+
+```{r}
+prospects_joined <- prospects %>%
+  left_join(vehicle, by = c('HHuniqueID'))%>%
+  left_join(household_axiom, by = 'HHuniqueID')%>%
+  left_join(household_credit, by = 'HHuniqueID')
+```
+
+
+## 3. Apply a treatment plan
+```{r}
+treated_prospects <- prepare(plan, prospects_joined)
+```
+
+
+## 4. Make predictions
+
+Using the random forest model, as it has the highest test set accuracy and more importantly, sensitivity. 
+
+```{r}
+prospect_preds_rf <- predict(rf_tuned_model, treated_prospects, type= c("prob"))
+```
+
+
+## 5. Join probabilities back to ID
+
+```{r}
+
+prospect_results <- cbind(prospects_joined, prospect_preds_rf)
+
+```
+
+
+
+## 6. Identify the top 100 "success" class probabilities from prospectsResults
+
+```{r}
+top_100_prospects <- as_tibble(prospect_results)%>%
+  rename(accepted_preds = `1`)%>%
+  slice_max(accepted_preds, n = 100)%>%
+  write_csv("top_100_prospects.csv")
+
+
+```
+
+
+
+# Parking lot
+
+### glm logistic regression attempt #2 with variables with 75%+ missing data removed
+
+
+
+Xvars2 <- c("Communication", "LastContactDay", "LastContactMonth", "NoOfContacts", "DaysPassed",   "PrevAttempts", "carMake", "carModel", "carYr",                 "headOfhouseholdGender", "PetsPurchases", "DigitalHabits_5_AlwaysOn", "AffluencePurchases", "Age", "Job",  "Marital", "Education", "DefaultOnRecord", "RecentBalance", "HHInsurance", "CarLoan")
+
+
+
+fit3 <- glm(Y_AcceptedOffer ~., data = treated_train, family ='binomial')
+
+summary(fit3)
+best_fit2 <- step(fit3, direction='backward')
+
+
+
+
+
+saveRDS(best_fit2, 'bestFit2.rds')
+best_fit2 <- read_rds('bestFit2.rds')
+
+
+## ASSESS: Predict & calculate the KPI appropriate for classification
+
+summary(best_fit2)
+
+length(coefficients(fit3))
+length(coefficients(best_fit2))
+
+training_preds <- predict(best_fit2, treated_train, type= "response")
+testing_preds  <- predict(best_fit2, treated_test, type= "response")
+
+
+# Classify 
+cutoff      <- 0.5
+customer_classes <- ifelse(training_preds >= cutoff, 1,0)
+
+# Organize w/Actual
+results <- data.frame(actual  = as.factor(train_data$Y_AcceptedOffer),
+                      customer = train_data$HHuniqueID,
+                      classes = as.factor(customer_classes),
+                      probs   = training_preds)
+
+
+train_confMat_missing_data_removed <- confusionMatrix(results$classes, results$actual, positive = "1")
+
+train_confMat_missing_data_removed
+
+ggplot(results, aes(x=probs, color=as.factor(actual))) +
+  geom_density() + 
+  geom_vline(aes(xintercept = cutoff), color = 'green')
+
+# ROC
+ROCobj <- roc(as.numeric(results$classes), as.numeric(results$actual))
+plot(ROCobj)
+
+# AUC
+auc(as.numeric(results$classes), as.numeric(results$actual))
+
+auc
+```
+
+compare model to test set
+
+# Classify 
+cutoff      <- 0.5
+customer_classes <- ifelse(testing_preds >= cutoff, 1,0)
+
+# Organize w/Actual
+results <- data.frame(actual  = as.factor(test_data$Y_AcceptedOffer),
+                      customer = test_data$HHuniqueID,
+                      classes = as.factor(customer_classes),
+                      probs   = testing_preds)
+
+
+test_confMat_missing_data_removed <- confusionMatrix(results$classes, results$actual, positive = "1")
+
+test_confMat_missing_data_removed
+
+
+## compare accuracy from glm model 1(most variables) and model 2(data with high missing data removed)
+
+
+train_confMat
+test_confMat
+train_confMat_missing_data_removed
+test_confMat_missing_data_removed
+train_confMat_3
+test_confMat_3
+
